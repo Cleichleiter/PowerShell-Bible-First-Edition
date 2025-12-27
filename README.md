@@ -1,4 +1,24 @@
+Project Status
+
+
+
+PowerShell Bible is an actively maintained, evolving repository.
+
+
+
+Content is added, refined, and reorganized as operational patterns mature, new failure modes are encountered, and tooling standards improve. Scripts and guidance are considered stable when published, but the overall structure should be treated as a living reference rather than a static release.
+
+
+
+Breaking changes are avoided where possible; however, interfaces and organization may evolve as the collection grows.
+
+
+
+
+
 PowerShell Bible
+
+
 
 
 
