@@ -3,20 +3,21 @@
 Generates an ops-friendly service health report (object output).
 
 .DESCRIPTION
-Queries Win32_Service and returns one row per service with:
+Queries services via CIM (Win32_Service) and returns one row per service with:
 - State (Running/Stopped/etc.)
 - StartMode (Auto/Manual/Disabled)
 - Health classification (OK/Warn/Critical)
-- Reason and suggested action signals
-- Service account, ProcessId, PathName (when available)
+- Reason (why it’s flagged)
+- Service account and PID
+- Optional PathName and dependency counts
 
 Designed for:
-- Daily/weekly health checks
+- Daily/weekly health reporting
 - Pre/post-change baselines
-- Incident triage (why isn't X running?)
+- Incident triage
 - CSV/HTML exports
 
-Uses CIM (Win32_Service) for consistency and remote support.
+All output is object-based and safe for automation.
 
 .PARAMETER ComputerName
 One or more computers to query. Defaults to local computer.
@@ -34,17 +35,20 @@ Filter by current state. Default: All.
 Filter by start mode. Default: All.
 
 .PARAMETER OnlyProblems
-Returns only services that appear unhealthy based on start mode and state.
+Returns only services that are non-OK (Warn/Critical) plus query errors.
 
 .PARAMETER ExpectedRunning
 Treat these services as critical if they are not running (regardless of StartMode).
-Supports wildcards. Example: "Spooler","w32time","MSSQLSERVER"
+Supports wildcards.
 
 .PARAMETER IncludePath
-Include ImagePath/PathName from Win32_Service (can be noisy but useful for malware triage).
+Include PathName from Win32_Service.
 
 .PARAMETER IncludeDependencies
-Include dependency counts (DependentServices / ServicesDependedOn).
+Include dependency counts (ServicesDependedOn / DependentServices).
+
+.PARAMETER ThrottleLimit
+Throttle limit when querying multiple remote hosts via PSSession. Default 16.
 
 .EXAMPLE
 .\Get-ServiceHealthReport.ps1 | Format-Table -Auto
@@ -57,10 +61,6 @@ Include dependency counts (DependentServices / ServicesDependedOn).
 .EXAMPLE
 .\Get-ServiceHealthReport.ps1 -ComputerName RDSH01,RDSH02 -ExpectedRunning TermService,UmRdpService -OnlyProblems |
   Export-Csv C:\Reports\ServiceHealth-RDS.csv -NoTypeInformation
-
-.EXAMPLE
-.\Get-ServiceHealthReport.ps1 -Name "MSSQL*" -State Running -IncludePath |
-  Format-Table -Auto
 
 .NOTES
 Author: Cheri
@@ -96,17 +96,18 @@ param(
     [switch]$IncludePath,
 
     [Parameter()]
-    [switch]$IncludeDependencies
+    [switch]$IncludeDependencies,
+
+    [Parameter()]
+    [ValidateRange(1,128)]
+    [int]$ThrottleLimit = 16
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 function Match-AnyWildcard {
-    param(
-        [string]$Value,
-        [string[]]$Patterns
-    )
+    param([string]$Value, [string[]]$Patterns)
     if (-not $Patterns -or $Patterns.Count -eq 0) { return $true }
     foreach ($p in $Patterns) {
         if ($Value -like $p) { return $true }
@@ -123,135 +124,179 @@ function Get-Health {
     )
 
     $isExpected = $false
-    if ($ExpectedRunningPatterns -and $ExpectedRunningPatterns.Count -gt 0) {
+    if ($ExpectedRunningPatterns) {
         foreach ($p in $ExpectedRunningPatterns) {
             if ($ServiceName -like $p) { $isExpected = $true; break }
         }
     }
 
-    # Critical: explicitly expected to run but isn't
     if ($isExpected -and $CurrentState -ne 'Running') {
-        return [PSCustomObject]@{
-            Health = 'Critical'
-            Reason = 'ExpectedRunning but not Running'
-        }
+        return [PSCustomObject]@{ Health='Critical'; Reason='ExpectedRunning but not Running' }
     }
 
-    # General logic based on start mode:
-    # - Auto + not Running => Critical
-    # - Disabled + Running => Warn
-    # - Manual => usually OK regardless of state (unless explicitly expected)
     if ($StartMode -eq 'Auto' -and $CurrentState -ne 'Running') {
-        return [PSCustomObject]@{
-            Health = 'Critical'
-            Reason = 'Auto-start service not running'
-        }
+        return [PSCustomObject]@{ Health='Critical'; Reason='Auto-start service not running' }
     }
 
     if ($StartMode -eq 'Disabled' -and $CurrentState -eq 'Running') {
-        return [PSCustomObject]@{
-            Health = 'Warn'
-            Reason = 'Disabled service is running'
-        }
+        return [PSCustomObject]@{ Health='Warn'; Reason='Disabled service is running' }
     }
 
     if ($CurrentState -like '*Pending') {
-        return [PSCustomObject]@{
-            Health = 'Warn'
-            Reason = 'Service in pending state'
-        }
+        return [PSCustomObject]@{ Health='Warn'; Reason='Service in pending state' }
     }
 
-    return [PSCustomObject]@{
-        Health = 'OK'
-        Reason = $null
+    return [PSCustomObject]@{ Health='OK'; Reason=$null }
+}
+
+function Get-ServiceHealthLocal {
+    param(
+        [string[]]$Name,
+        [string[]]$DisplayName,
+        [string]$State,
+        [string]$StartMode,
+        [bool]$OnlyProblems,
+        [string[]]$ExpectedRunning,
+        [bool]$IncludePath,
+        [bool]$IncludeDependencies
+    )
+
+    $now = Get-Date
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    try {
+        $services = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
+
+        foreach ($s in @($services)) {
+            if (-not (Match-AnyWildcard -Value $s.Name -Patterns $Name)) { continue }
+            if (-not (Match-AnyWildcard -Value $s.DisplayName -Patterns $DisplayName)) { continue }
+
+            if ($State -ne 'All' -and $s.State -ne $State) { continue }
+            if ($StartMode -ne 'All' -and $s.StartMode -ne $StartMode) { continue }
+
+            $health = Get-Health -ServiceName $s.Name -CurrentState $s.State -StartMode $s.StartMode -ExpectedRunningPatterns $ExpectedRunning
+            if ($OnlyProblems -and $health.Health -eq 'OK') { continue }
+
+            $obj = [ordered]@{
+                Timestamp      = $now
+                ComputerName   = $env:COMPUTERNAME
+                Name           = $s.Name
+                DisplayName    = $s.DisplayName
+                State          = $s.State
+                StartMode      = $s.StartMode
+                StartName      = $s.StartName
+                ProcessId      = $s.ProcessId
+                ExitCode       = $s.ExitCode
+                ServiceType    = $s.ServiceType
+                Health         = $health.Health
+                Reason         = $health.Reason
+
+                PathName       = $null
+                ServicesDependedOnCount = $null
+                DependentServicesCount  = $null
+                Error          = $null
+            }
+
+            if ($IncludePath) {
+                $obj.PathName = $s.PathName
+            }
+
+            if ($IncludeDependencies) {
+                try { $obj.ServicesDependedOnCount = @($s.ServicesDependedOn).Count } catch {}
+                try { $obj.DependentServicesCount  = @($s.DependentServices).Count } catch {}
+            }
+
+            $rows.Add([PSCustomObject]$obj)
+        }
     }
+    catch {
+        $rows.Add([PSCustomObject]@{
+            Timestamp      = $now
+            ComputerName   = $env:COMPUTERNAME
+            Name           = $null
+            DisplayName    = $null
+            State          = $null
+            StartMode      = $null
+            StartName      = $null
+            ProcessId      = $null
+            ExitCode       = $null
+            ServiceType    = $null
+            Health         = 'Error'
+            Reason         = 'Service query failed'
+            PathName       = $null
+            ServicesDependedOnCount = $null
+            DependentServicesCount  = $null
+            Error          = $_.Exception.Message
+        })
+    }
+
+    $rows
 }
 
 $results = New-Object System.Collections.Generic.List[object]
 
-foreach ($c in $ComputerName) {
-    $target = $c.Trim()
-    if ([string]::IsNullOrWhiteSpace($target)) { continue }
-
+# If multiple computers, use PSSessions for efficiency/throttle control
+if ($ComputerName.Count -gt 1) {
+    $sessions = @()
     try {
-        $services = Get-CimInstance -ClassName Win32_Service -ComputerName $target -ErrorAction Stop
+        $sessions = New-PSSession -ComputerName $ComputerName -ThrottleLimit $ThrottleLimit
+        $rows = Invoke-Command -Session $sessions -ScriptBlock ${function:Get-ServiceHealthLocal} -ArgumentList @(
+            $Name, $DisplayName, $State, $StartMode,
+            [bool]$OnlyProblems, $ExpectedRunning,
+            [bool]$IncludePath, [bool]$IncludeDependencies
+        )
+        foreach ($r in @($rows)) { $results.Add($r) }
+    }
+    finally {
+        if ($sessions) { $sessions | Remove-PSSession -ErrorAction SilentlyContinue }
+    }
+}
+else {
+    foreach ($c in $ComputerName) {
+        $target = $c.Trim()
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
 
-        foreach ($s in @($services)) {
-            # Filters: Name / DisplayName
-            if (-not (Match-AnyWildcard -Value $s.Name -Patterns $Name)) { continue }
-            if (-not (Match-AnyWildcard -Value $s.DisplayName -Patterns $DisplayName)) { continue }
+        try {
+            if ($target -eq $env:COMPUTERNAME -or $target -eq 'localhost') {
+                $rows = Get-ServiceHealthLocal -Name $Name -DisplayName $DisplayName -State $State -StartMode $StartMode `
+                    -OnlyProblems:$OnlyProblems -ExpectedRunning $ExpectedRunning -IncludePath:$IncludePath -IncludeDependencies:$IncludeDependencies
+            }
+            else {
+                $rows = Invoke-Command -ComputerName $target -ScriptBlock ${function:Get-ServiceHealthLocal} -ArgumentList @(
+                    $Name, $DisplayName, $State, $StartMode,
+                    [bool]$OnlyProblems, $ExpectedRunning,
+                    [bool]$IncludePath, [bool]$IncludeDependencies
+                )
+            }
 
-            # Filter: State
-            if ($State -ne 'All' -and $s.State -ne $State) { continue }
-
-            # Filter: StartMode
-            # Win32_Service StartMode is typically: "Auto", "Manual", "Disabled"
-            if ($StartMode -ne 'All' -and $s.StartMode -ne $StartMode) { continue }
-
-            $healthObj = Get-Health -ServiceName $s.Name -CurrentState $s.State -StartMode $s.StartMode -ExpectedRunningPatterns $ExpectedRunning
-
-            if ($OnlyProblems -and $healthObj.Health -eq 'OK') { continue }
-
-            $row = [ordered]@{
-                Timestamp     = (Get-Date)
-                ComputerName  = $target
-                Name          = $s.Name
-                DisplayName   = $s.DisplayName
-                State         = $s.State
-                StartMode     = $s.StartMode
-                StartName     = $s.StartName
-                ProcessId     = $s.ProcessId
-                ExitCode      = $s.ExitCode
-                ServiceType   = $s.ServiceType
-                Health        = $healthObj.Health
-                Reason        = $healthObj.Reason
-                CanStop       = $null
-                DelayedAutoStart = $null
-                PathName      = $null
+            foreach ($r in @($rows)) {
+                # Normalize ComputerName for remote suggests (script returns local env:COMPUTERNAME)
+                if ($r -and $r.PSObject.Properties.Match('ComputerName').Count -gt 0) {
+                    # Keep original host value; it’s already correct when executed remotely.
+                }
+                $results.Add($r)
+            }
+        }
+        catch {
+            $results.Add([PSCustomObject]@{
+                Timestamp      = (Get-Date)
+                ComputerName   = $target
+                Name           = $null
+                DisplayName    = $null
+                State          = $null
+                StartMode      = $null
+                StartName      = $null
+                ProcessId      = $null
+                ExitCode       = $null
+                ServiceType    = $null
+                Health         = 'Error'
+                Reason         = 'Remote query failed'
+                PathName       = $null
                 ServicesDependedOnCount = $null
                 DependentServicesCount  = $null
-            }
-
-            # DelayedAutoStart exists on many modern Windows builds; best-effort
-            try { $row.DelayedAutoStart = $s.DelayedAutoStart } catch {}
-
-            # CanStop isn't directly on Win32_Service; derive best-effort
-            # If AcceptStop property exists in CIM (not consistent), otherwise infer from state
-            try { $row.CanStop = [bool]$s.AcceptStop } catch { $row.CanStop = ($s.State -eq 'Running') }
-
-            if ($IncludePath) {
-                $row.PathName = $s.PathName
-            }
-
-            if ($IncludeDependencies) {
-                try { $row.ServicesDependedOnCount = @($s.ServicesDependedOn).Count } catch {}
-                try { $row.DependentServicesCount  = @($s.DependentServices).Count } catch {}
-            }
-
-            $results.Add([PSCustomObject]$row)
+                Error          = $_.Exception.Message
+            })
         }
-    }
-    catch {
-        $results.Add([PSCustomObject]@{
-            Timestamp    = (Get-Date)
-            ComputerName = $target
-            Name         = $null
-            DisplayName  = $null
-            State        = $null
-            StartMode    = $null
-            StartName    = $null
-            ProcessId    = $null
-            ExitCode     = $null
-            ServiceType  = $null
-            Health       = 'Error'
-            Reason       = $_.Exception.Message
-            CanStop      = $null
-            DelayedAutoStart = $null
-            PathName     = $null
-            ServicesDependedOnCount = $null
-            DependentServicesCount  = $null
-        })
     }
 }
 
